@@ -1,6 +1,6 @@
-# Proyecto (2023) de Clasificación de Imágenes: Humano vs Perro
+# Proyecto (2023) de Clasificación de Imágenes: Comida vs Perro
 
-Este proyecto usa **TensorFlow/Keras** para entrenar una red neuronal convolucional (CNN) que clasifica imágenes entre humano y perro (o dog/food según tu dataset).  
+Este proyecto usa **TensorFlow/Keras** para entrenar una red neuronal convolucional (CNN) que clasifica imágenes entre comida y perro (o dog/food según tu dataset).  
 
 ---
 
