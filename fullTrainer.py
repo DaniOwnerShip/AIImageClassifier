@@ -1,149 +1,195 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['AUTOGRAPH_VERBOSITY'] = '0'
+
+import warnings
+warnings.filterwarnings('ignore')
+
 import tensorflow as tf
-from tensorflow import keras
+tf.get_logger().setLevel('ERROR')
+
 import numpy as np
-import pandas as pd 
-from PIL import Image 
-from sklearn.model_selection import train_test_split  
-from keras import layers 
-from sklearn.model_selection import StratifiedKFold
-import matplotlib.pyplot as plt
-from matplotlib.image import imread
-from keras.callbacks import TensorBoard
-from keras.models import Sequential
-from keras.layers import Conv2D, MaxPooling2D, Flatten, Dense
-import io
-  
-dataTest = pd.read_parquet('test-00000-of-00001-6ea6ccdcc8fa38d5.parquet')
-imagesTest = np.array(dataTest['image'].tolist())  
-labelTest = np.array(dataTest['label'].tolist())       
+import pandas as pd
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 
-dataTrain = pd.read_parquet('train-00000-of-00001-9bf5abf8b080cbba.parquet') 
-imagesTrain = np.array(dataTrain['image'].tolist())  
-labelTrain = np.array(dataTrain['label'].tolist())  
-
-
-print('tipe ', len(imagesTest))
-print('tipe ', type(imagesTest[880])) 
- 
-
-for i in np.arange(0, 51):
-    img_bytes = imagesTest[i]['bytes']
-    img_data = io.BytesIO(img_bytes) 
-    img = Image.open(img_data)  
-    image = img.convert("L") 
-    image = image.resize((128, 128)) 
-    image.save(f'./ImgTestHuman2/imageTest{i}.jpg')
-#img.img_bytes('imageTest.jpg')
-
-#print('tipe ', imagesTest[880]['bytes'])
-
-print('**************')
-img_bytes = imagesTest[0]['bytes']
-immg = tf.image.decode_jpeg(img_bytes) 
-resized_image = tf.image.resize(immg, (128, 128))
-resized_image = tf.image.rgb_to_grayscale(resized_image) 
-print('sss ', resized_image.shape)
-
-#imgg = image_tensorsTrain[9,:,:]  
-
-
-
-image_tensorsTrain = []
-for image in imagesTrain:
-    image_bytes = image['bytes']
-    image_tensor = tf.image.decode_jpeg(image_bytes) 
-    resized_image = tf.image.resize(image_tensor, (128, 128))
-    resized_image = tf.image.rgb_to_grayscale(resized_image) 
-    image_tensorsTrain.append(resized_image)  
-image_tensorsTrain = np.array(image_tensorsTrain)
+from tensorflow.keras import layers, Sequential
+from tensorflow.keras.callbacks import TensorBoard, EarlyStopping
+from tensorflow.keras.layers import Dense, Dropout, RandomFlip, RandomRotation, RandomZoom
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2, preprocess_input
 
  
+# ==================== CONFIGURATION ====================
+EPOCHS = 100             # Higher = more learning, but may lead to overfitting
+BATCH_SIZE = 16          # Lower = more stable, higher = faster but potentially less accurate
+LEARNING_RATE = 1e-4     # Lower = fine-grained learning, higher = faster but unstable
+IMG_SIZE = (256, 256)    # Larger = more detail (better for small defects), uses more memory
 
-image_tensorsTest = []
-for image in imagesTest:
-    image_bytes = image['bytes']
-    image_tensor = tf.image.decode_jpeg(image_bytes) 
-    resized_image = tf.image.resize(image_tensor, (128, 128))
-    resized_image = tf.image.rgb_to_grayscale(resized_image) 
-    image_tensorsTest.append(resized_image)  
-image_tensorsTest = np.array(image_tensorsTest)
+# Model
+DENSE_UNITS = 128        # Higher = more capacity, but higher risk of overfitting
+DROPOUT = 0.3            # Higher = more regularization, prevents overfitting but may slow down learning
+FINE_TUNING = False      # True = higher precision (if plenty of data exists), False = more stable/faster
 
-print('tipe ', image_tensorsTest.dtype)
+# Data augmentation
+AUG_FLIP_H = False       # True = improves generalization if orientation doesn't matter
+AUG_FLIP_V = False       # True = useful if parts can be inverted
+AUG_ROTATION = 0.05      # Higher = more robust to rotation, too much can cause confusion
+AUG_ZOOM = 0.05          # Higher = better with varying distances, too much causes distortion
+
+# Paths
+TRAIN_DIR = './archive/train/'      # Folder containing training images
+CSV_PATH = './archive/train.csv'    # CSV with labels (0=OK, 1=BAD)
+MODEL_PATH = './screw_model.keras'  # Path where the model is saved
+# ====================================================== 
 
 
-"""
-img = Image.fromarray(image_tensorsTest[0].astype('uint8')) 
-img.save('imageTest.png')
-img_data = io.BytesIO(img_bytes) 
-img = Image.open(img_data)  
-image = img.convert("L") 
-image = image.resize((128, 128)) 
-image.save('imageTest.jpg')
-gpu_available = tf.test.is_built_with_cuda()
-print("gpu_available " , gpu_available)
-"""
+# -------------------- Data augmentation --------------------
+aug_layers = []
+if AUG_FLIP_H:
+    aug_layers.append(RandomFlip("horizontal"))
+if AUG_FLIP_V:
+    aug_layers.append(RandomFlip("vertical"))
+if AUG_ROTATION > 0:
+    aug_layers.append(RandomRotation(AUG_ROTATION))
+if AUG_ZOOM > 0:
+    aug_layers.append(RandomZoom(AUG_ZOOM))
 
+data_augmentation = Sequential(aug_layers, name="augmentation") if aug_layers else None
+
+
+# -------------------- Load data --------------------
+data = pd.read_csv(CSV_PATH)
+
+print(f"Total samples: {len(data)}")
+print("Class distribution:")
+print(data['anomaly'].value_counts().sort_index())
+
+images = []
+labels = []
+
+for _, row in data.iterrows():
+    img_path = os.path.join(TRAIN_DIR, row['filename'])
+    if os.path.exists(img_path):
+        img = Image.open(img_path).convert('RGB')
+        img = img.resize(IMG_SIZE)
+        images.append(np.array(img, dtype=np.float32))
+        labels.append(int(row['anomaly']))
+
+images = np.array(images, dtype=np.float32)
+labels = np.array(labels, dtype=np.int32)
+
+print(f"Loaded {len(images)} images")
+
+
+# -------------------- Split --------------------
+X_train, X_val, y_train, y_val = train_test_split(
+    images,
+    labels,
+    test_size=0.2,
+    random_state=42,
+    stratify=labels
+)
+
+
+# CORRECT Preprocessing for MobileNetV2
+X_train = preprocess_input(X_train)
+X_val = preprocess_input(X_val)
+
+print(f"Train: {len(X_train)}, Validation: {len(X_val)}")
+
+
+
+# -------------------- Class weights --------------------
+classes = np.unique(y_train)
+class_weights = compute_class_weight(
+    class_weight='balanced',
+    classes=classes,
+    y=y_train
+)
+class_weight_dict = {int(c): float(w) for c, w in zip(classes, class_weights)}
+print(f"Class weights: {class_weight_dict}")
+
+
+# -------------------- Build model --------------------
+base_model = MobileNetV2(
+    weights='imagenet',
+    include_top=False,
+    input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3)
+)
+
+base_model.trainable = FINE_TUNING
+
+inputs = layers.Input(shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+x = inputs
+
+if data_augmentation is not None:
+    x = data_augmentation(x)
+
+x = base_model(x, training=False)
+x = layers.GlobalAveragePooling2D()(x)
+x = Dense(DENSE_UNITS, activation='relu')(x)
+x = Dropout(DROPOUT)(x)
+outputs = Dense(1, activation='sigmoid')(x)
+
+model = tf.keras.Model(inputs, outputs)
+
+model.compile(
+    optimizer=Adam(learning_rate=LEARNING_RATE),
+    loss='binary_crossentropy',
+    metrics=[
+        'accuracy',
+        tf.keras.metrics.Precision(name='precision'),
+        tf.keras.metrics.Recall(name='recall'),
+        tf.keras.metrics.AUC(name='auc')
+    ]
+)
+
+model.summary()
+
+
+# -------------------- Callbacks --------------------
 tensorboard_callback = TensorBoard(log_dir="./logs")
-
-print("image_tensorsTrain ", len(image_tensorsTrain))  
-
-
-fig, axes = plt.subplots(3, 3, figsize=(8, 8))
-axes = axes.ravel()
-for i in np.arange(839, 848):
-    axes[i-839].imshow(image_tensorsTrain[i]) 
-    axes[i-839].set_title(labelTrain[i])
-    axes[i-839].axis('off')
-    plt.subplots_adjust(wspace=1)
-plt.show()
+early_stopping = EarlyStopping(
+    monitor='val_auc',
+    mode='max',
+    patience=5,                 # Stops if no improvement after 5 epochs; allows using high epoch counts without overfitting
+    restore_best_weights=True   # Automatically restores the best model found during training
+)
 
 
-
-print("image_tensorsTrain ", len(image_tensorsTrain)) 
-
-# Define the model architecture
-model = Sequential()
-model.add(Conv2D(32, (3, 3), activation='relu', input_shape=(128, 128, 1)))
-model.add(MaxPooling2D((2, 2)))
-model.add(Conv2D(64, (3, 3), activation='relu'))
-model.add(MaxPooling2D((2, 2)))
-model.add(Conv2D(128, (3, 3), activation='relu'))
-model.add(MaxPooling2D((2, 2)))
-model.add(Conv2D(128, (3, 3), activation='relu'))
-model.add(MaxPooling2D((2, 2)))
-model.add(Flatten())
-model.add(Dense(512, activation='relu'))
-model.add(Dense(1, activation='sigmoid'))
-
-# Compile the model
-model.compile(loss='binary_crossentropy',
-              optimizer='adam',
-              metrics=['accuracy'])
-
-# Train the model
-history = model.fit(image_tensorsTrain, labelTrain,
-                    epochs=10,
-                    batch_size=64,
-                    validation_data=(image_tensorsTest, labelTest),
-                    callbacks=[tensorboard_callback])
+# -------------------- Train --------------------
+print("Training model...")
+history = model.fit(
+    X_train, y_train,
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    validation_data=(X_val, y_val),
+    class_weight=class_weight_dict,
+    callbacks=[tensorboard_callback, early_stopping],
+    verbose=1
+)
 
 
-# evaluar modelo en conjunto de datos de prueba
-test_loss, test_acc = model.evaluate(image_tensorsTest, labelTest, verbose=2)
+# -------------------- Evaluate --------------------
+val_loss, val_acc, val_precision, val_recall, val_auc = model.evaluate(X_val, y_val, verbose=2)
+print(f'Validation accuracy : {val_acc:.4f}')
+print(f'Validation precision: {val_precision:.4f}')
+print(f'Validation recall   : {val_recall:.4f}')
+print(f'Validation AUC      : {val_auc:.4f}')
 
-print('Test accuracy:', test_acc)
+
+# -------------------- Debug predictions --------------------
+preds = model.predict(X_val, verbose=0).ravel()
+pred_labels = (preds >= 0.5).astype(np.int32)
+
+print("Real labels count      :", np.bincount(y_val))
+print("Predicted labels count :", np.bincount(pred_labels))
+print("Prediction min/max/mean:", preds.min(), preds.max(), preds.mean())
 
 
-
-"""
-print("image_tensorsTrain ", len(image_tensorsTrain)) 
-# mostrar imágenes
-fig, axes = plt.subplots(3, 3, figsize=(8, 8))
-axes = axes.ravel()
-for i in np.arange(839, 848):
-    axes[i-839].imshow(image_tensorsTrain[i])
-    axes[i-839].set_title(labelTrain[i])
-    axes[i-839].axis('off')
-    plt.subplots_adjust(wspace=1)
-plt.show()
-"""
+# -------------------- Save --------------------
+model.save(MODEL_PATH)
+print(f'Model saved to {MODEL_PATH}')
